@@ -576,6 +576,46 @@ def scan_background_space(
 
 
 # ============================================================
+# 12b. Lightweight sweep over (epsJT, epsSch)
+# ============================================================
+
+def sweep_epsJT_epsSch(
+    p: Params,
+    jt_grid=jnp.linspace(0.0, 0.35, 21),
+    sch_grid=jnp.linspace(0.0, 0.6, 21),
+    dm2=0.0,
+    dl=0.0,
+):
+    """
+    Lightweight sweep of raw novelty metric over (epsJT, epsSch).
+    Struktur dikembalikan sama persis seperti yang diharapkan run_engine().
+    """
+    def one(ejt, esch):
+        total, comps, _ = novelty_components_raw(p, ejt, esch, dm2, dl)
+        return total, comps
+
+    totals, comps = jax.vmap(
+        lambda ejt: jax.vmap(lambda esch: one(ejt, esch))(sch_grid)
+    )(jt_grid)
+
+    # comps adalah tuple 4 elemen, masing-masing array 2D
+    cA   = comps[0]
+    cred = comps[1]
+    cmH  = comps[2]
+    cG   = comps[3]
+
+    return {
+        "JT":   jt_grid,
+        "SCH":  sch_grid,
+        "vals": totals,
+        "cA":   cA,
+        "cred": cred,
+        "cmH":  cmH,
+        "cG":   cG,
+    }
+
+
+# ============================================================
 # 13. Runner
 # ============================================================
 
