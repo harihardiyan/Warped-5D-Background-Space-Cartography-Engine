@@ -1,3 +1,4 @@
+
 import jax
 import jax.numpy as jnp
 from dataclasses import dataclass
@@ -5,28 +6,12 @@ from dataclasses import dataclass
 jax.config.update("jax_enable_x64", True)
 
 # ============================================================
-# 0. Safe helpers (pure JAX)
-# ============================================================
-
-def safe_exp(x, low=-700.0, high=700.0):
-    x_clipped = jnp.clip(x, low, high)
-    return jnp.exp(x_clipped)
-
-def safe_div(n, d, eps=1e-300):
-    return n / (d + eps)
-
-def pct(a, b):
-    denom = jnp.where(jnp.abs(b) > 1e-30, b, jnp.array(1.0))
-    return 100.0 * (a - b) / denom
-
-
-# ============================================================
 # 1. Parameters (geometry, scales, phenomenology)
 # ============================================================
 
 @dataclass
 class Params:
-    # Geometry and baseline RS-like background
+    # Geometry and baseline effective RS-like background
     k: float = 1.0
     L: float = 1.0
     rc: float = 12.0
@@ -35,7 +20,7 @@ class Params:
     Ny: int = 3001
     kappa5_sq: float = 1.0
 
-    # Grid shaping (for potential future use; here we use uniform)
+    # Grid shaping
     stretch: float = 0.35
     alpha: float = 4.0
 
@@ -53,6 +38,26 @@ class Params:
     # Physical scales
     mH_bare: float = 125.0
     M5: float = 1.0e18
+
+    # Numerical safety thresholds
+    A_abs_max: float = 200.0
+    Aprime_abs_max: float = 200.0
+
+
+# ============================================================
+# 0. Safe helpers (pure JAX)
+# ============================================================
+
+def safe_exp(x, low=-700.0, high=700.0):
+    x_clipped = jnp.clip(x, low, high)
+    return jnp.exp(x_clipped)
+
+def safe_div(n, d, eps=1e-300):
+    return n / (d + eps)
+
+def pct(a, b):
+    denom = jnp.where(jnp.abs(b) > 1e-30, b, jnp.array(1.0))
+    return 100.0 * (a - b) / denom
 
 
 # ============================================================
@@ -77,19 +82,19 @@ def ir_window(y, Ymax, p: Params):
 
 
 # ============================================================
-# 3. Physics: RS-like superpotential system
+# 3. Physics: effective RS-like superpotential system
 # ============================================================
 
 def W0(p: Params):
-    # Simple RS-like constant superpotential
+    # Constant effective superpotential (toy RS-like)
     return jnp.array(3.0 * p.k / p.kappa5_sq, dtype=jnp.float64)
 
 def rhs_superpotential(p: Params, y, U, Ymax, c2):
     """
-    Baseline RS-like first-order system:
+    Effective first-order system:
       dφ/dy = 2 c2 φ
       dA/dy = (κ5^2 / 3) [ W0 + c2 φ^2 ]
-    This is the 'honest' physics sector.
+    This is a self-consistent toy model, not a full RS solution.
     """
     phi, A = U
     dphi = 2.0 * c2 * phi
@@ -103,16 +108,16 @@ def rhs_superpotential(p: Params, y, U, Ymax, c2):
 
 def rhs_superpotential_deformed(p: Params, y, U, Ymax, c2, vUV_eff):
     """
-    Phenomenological deformation of the RS-like system:
+    Phenomenological deformation of the effective RS-like system:
       dφ/dy as in baseline
       dA/dy = A'_base + IR-localized deformations (eps_JT, eps_Sch)
     This is NOT derived from a superpotential; it is a controlled
-    phenomenological experiment.
+    phenomenological experiment (off-shell background engineering).
     """
     phi, A = U
     dphi = 2.0 * c2 * phi
 
-    # Baseline RS-like A'
+    # Baseline effective A'
     Aprime_base = (p.kappa5_sq / 3.0) * (W0(p) + c2 * (phi**2))
 
     # IR-localized window
@@ -132,8 +137,7 @@ def rhs_superpotential_deformed(p: Params, y, U, Ymax, c2, vUV_eff):
 def uv_renormalized_params(p: Params, Ymax):
     """
     Phenomenological UV counter-terms: effective vUV and c2.
-    Again: not derived from a full renormalization calculation,
-    but a controlled parametrization.
+    Not a true renormalization calculation; just a parametrization.
     """
     c2_base = jnp.log(jnp.array(p.vIR / p.vUV, dtype=jnp.float64)) / (2.0 * Ymax)
 
@@ -152,7 +156,7 @@ def uv_renormalized_params(p: Params, Ymax):
 
 
 # ============================================================
-# 5. Integrator: fixed-step RK4 (pure JAX)
+# 5. Integrator: fixed-step RK4 (pure JAX, stretched grid default)
 # ============================================================
 
 def integrate_fixed_rk4(fun, p: Params, y: jnp.ndarray, U0: jnp.ndarray, Ymax, c2):
@@ -240,20 +244,31 @@ def audit_phi_monotone(phi: jnp.ndarray, tol: float = 1e-5):
     ok = jnp.all(dphi <= tol) if dphi.size else jnp.array(True)
     return {"phi_nonincreasing": ok}
 
+def audit_overflow_A_Aprime(A: jnp.ndarray, y: jnp.ndarray, p: Params):
+    """
+    Numerical safety audit: |A| and |A'| below user-defined thresholds.
+    """
+    A_abs_ok = jnp.max(jnp.abs(A)) <= p.A_abs_max
+    dA = jnp.diff(A) / jnp.diff(y)
+    Aprime_abs_ok = jnp.max(jnp.abs(dA)) <= p.Aprime_abs_max
+    return {
+        "A_abs_ok": A_abs_ok,
+        "Aprime_abs_ok": Aprime_abs_ok,
+    }
+
 
 # ============================================================
-# 8. Solvers: baseline RS vs phenomenological deformation
+# 8. Solvers: baseline effective vs phenomenological deformation
 # ============================================================
 
 def solve_superpotential_and_hierarchy(p: Params):
-    # Use uniform grid for clean convergence studies
-    _, Ymax = make_stretched_grid(p)
-    y_uni = make_uniform_grid(Ymax, p.Ny)
+    # Stretched grid as default for physics
+    y_str, Ymax = make_stretched_grid(p)
 
     c2 = jnp.log(jnp.array(p.vIR / p.vUV, dtype=jnp.float64)) / (2.0 * Ymax)
     U0 = jnp.array([p.vUV, 0.0], dtype=jnp.float64)
 
-    Y = integrate_fixed_rk4(rhs_superpotential, p, y_uni, U0, Ymax, c2)
+    Y = integrate_fixed_rk4(rhs_superpotential, p, y_str, U0, Ymax, c2)
     phi = Y[:, 0]
     A   = Y[:, 1]
 
@@ -263,12 +278,13 @@ def solve_superpotential_and_hierarchy(p: Params):
         "monotone_A":             audit_monotone_A(A),
         "sign_Aprime":            audit_sign_Aprime(A),
         "phi_monotone":           audit_phi_monotone(phi),
+        "overflow":               audit_overflow_A_Aprime(A, y_str, p),
     }
     redshift = redshift_outputs(A, p)
-    Mpl_eff  = planck_mass_integral(A, y_uni)
+    Mpl_eff  = planck_mass_integral(A, y_str)
 
     return {
-        "y":        y_uni,
+        "y":        y_str,
         "phi":      phi,
         "A":        A,
         "c2":       c2,
@@ -280,11 +296,10 @@ def solve_superpotential_and_hierarchy(p: Params):
 
 def solve_superpotential_with_deformation(p: Params):
     """
-    Phenomenological deformation of the RS-like background.
+    Phenomenological deformation of the effective RS-like background.
     All deviations from baseline are explicitly labeled as such.
     """
-    _, Ymax = make_stretched_grid(p)
-    y_uni = make_uniform_grid(Ymax, p.Ny)
+    y_str, Ymax = make_stretched_grid(p)
 
     vUV_eff, c2_eff = uv_renormalized_params(p, Ymax)
     U0 = jnp.array([vUV_eff, 0.0], dtype=jnp.float64)
@@ -292,7 +307,7 @@ def solve_superpotential_with_deformation(p: Params):
     def fun_corr(p_, y_, U_, Ymax_, c2_):
         return rhs_superpotential_deformed(p_, y_, U_, Ymax_, c2_, vUV_eff)
 
-    Y = integrate_fixed_rk4(fun_corr, p, y_uni, U0, Ymax, c2_eff)
+    Y = integrate_fixed_rk4(fun_corr, p, y_str, U0, Ymax, c2_eff)
     phi = Y[:, 0]
     A   = Y[:, 1]
 
@@ -302,9 +317,10 @@ def solve_superpotential_with_deformation(p: Params):
         "monotone_A":             audit_monotone_A(A),
         "sign_Aprime":            audit_sign_Aprime(A),
         "phi_monotone":           audit_phi_monotone(phi),
+        "overflow":               audit_overflow_A_Aprime(A, y_str, p),
     }
     redshift = redshift_outputs(A, p)
-    Mpl_eff  = planck_mass_integral(A, y_uni)
+    Mpl_eff  = planck_mass_integral(A, y_str)
 
     # Effective IR Newton constant (phenomenological)
     G_IR = safe_div(1.0, Mpl_eff) * safe_exp(2.0 * A[-1])
@@ -313,7 +329,7 @@ def solve_superpotential_with_deformation(p: Params):
     mH_eff = p.mH_bare * redshift["redshift"]
 
     return {
-        "y":         y_uni,
+        "y":         y_str,
         "phi":       phi,
         "A":         A,
         "audits":    audits,
@@ -344,9 +360,10 @@ def compare_deformed_vs_RS(p: Params,
         corr["redshift"]["redshift"],
         base["redshift"]["redshift"]
     )
+    G_IR_base = safe_div(1.0, base["Mpl_eff"]) * safe_exp(2.0 * base["A"][-1])
     dG_pct = pct(
         corr["G_IR_eff"],
-        safe_div(1.0, base["Mpl_eff"]) * safe_exp(2.0 * base["A"][-1])
+        G_IR_base
     )
 
     # Kinematic “too-violent warp” audit
@@ -355,25 +372,36 @@ def compare_deformed_vs_RS(p: Params,
     ok_dG   = jnp.abs(dG_pct) <= max_abs_dG_pct
     warp_ok = ok_dA & ok_red & ok_dG
 
+    audit_corr = corr["audits"]
+    audit_base = base["audits"]
+
+    audit_pass_corr = (
+        audit_corr["monotone_A"]["nonincreasing"]
+        & audit_corr["volume_ratio_pointwise"]["pass"]
+        & audit_corr["sign_Aprime"]["Aprime_consistent_sign"]
+        & audit_corr["phi_monotone"]["phi_nonincreasing"]
+        & audit_corr["overflow"]["A_abs_ok"]
+        & audit_corr["overflow"]["Aprime_abs_ok"]
+        & warp_ok
+    )
+
+    audit_pass_base = (
+        audit_base["monotone_A"]["nonincreasing"]
+        & audit_base["volume_ratio_pointwise"]["pass"]
+        & audit_base["sign_Aprime"]["Aprime_consistent_sign"]
+        & audit_base["phi_monotone"]["phi_nonincreasing"]
+        & audit_base["overflow"]["A_abs_ok"]
+        & audit_base["overflow"]["Aprime_abs_ok"]
+    )
+
     report = {
         "ΔA_IR": dA_IR,
         "redshift_pct_dev": red_dev,
         "ΔmH_eff_GeV": corr["mH_eff"] - (p.mH_bare * base["redshift"]["redshift"]),
         "ΔG_IR_eff_pct": dG_pct,
         "warp_ok": warp_ok,
-        "audit_pass_corr": (
-            corr["audits"]["monotone_A"]["nonincreasing"]
-            & corr["audits"]["volume_ratio_pointwise"]["pass"]
-            & corr["audits"]["sign_Aprime"]["Aprime_consistent_sign"]
-            & corr["audits"]["phi_monotone"]["phi_nonincreasing"]
-            & warp_ok
-        ),
-        "audit_pass_base": (
-            base["audits"]["monotone_A"]["nonincreasing"]
-            & base["audits"]["volume_ratio_pointwise"]["pass"]
-            & base["audits"]["sign_Aprime"]["Aprime_consistent_sign"]
-            & base["audits"]["phi_monotone"]["phi_nonincreasing"]
-        ),
+        "audit_pass_corr": audit_pass_corr,
+        "audit_pass_base": audit_pass_base,
     }
     return {"baseline": base, "deformed": corr, "report": report}
 
@@ -385,8 +413,8 @@ def compare_deformed_vs_RS(p: Params,
 def novelty_components_raw(p: Params, epsJT, epsSch, dm2=0.0, dl=0.0):
     """
     Phenomenological novelty metric: how much the deformed background
-    deviates from RS-like baseline in a few observables.
-    This function must stay JAX-friendly (no float(...) on tracers).
+    deviates from effective RS-like baseline in a few observables.
+    JAX-friendly.
     """
     p2 = Params(**{
         **p.__dict__,
@@ -410,6 +438,7 @@ def numerical_floors_from_convergence(p: Params, Ny_list=(1501, 3001, 6001)):
     """
     Estimate numerical floors for each novelty component via Ny-convergence
     at very small deformations (close to baseline).
+    This is a driver-level routine (not jitted) because Ny_list is Python.
     """
     epsJT  = jnp.array(1e-6, dtype=jnp.float64)
     epsSch = jnp.array(2e-6, dtype=jnp.float64)
@@ -466,14 +495,18 @@ def gradient_ascent_normalized(
     bounds=((0.0, 0.5), (0.0, 0.8), (-0.2, 0.2), (-0.2, 0.2)),
     norm="l1",
 ):
+    """
+    Driver-level routine (Python loop) that internally uses JAX grad.
+    """
     epsJT, epsSch, dm2, dl = [jnp.array(x, dtype=jnp.float64) for x in init]
-    traj = []
 
     def metric(a, b, c, d):
         val_n, _, _, _ = novelty_components_normalized(p, a, b, floors, c, d, norm=norm)
         return val_n
 
     grad4 = jax.grad(lambda a, b, c, d: metric(a, b, c, d), argnums=(0, 1, 2, 3))
+
+    traj = []
 
     for t in range(steps):
         g_tuple = grad4(epsJT, epsSch, dm2, dl)
@@ -556,8 +589,6 @@ def scan_background_space(
       scan (epsJT, epsSch) and classify each point as allowed/forbidden
       based on audits (including too-violent warp), and record key deviations.
     """
-    JT, SCH = jnp.meshgrid(jt_grid, sch_grid, indexing="ij")
-
     def one(ejt, esch):
         return classify_point_jax(p_base, ejt, esch, dm2, dl)
 
@@ -622,7 +653,7 @@ def sweep_epsJT_epsSch(
 def run_engine():
     p = Params()
 
-    # Baseline RS-like solution
+    # Baseline effective solution
     base = solve_superpotential_and_hierarchy(p)
     print("Baseline A_IR:", float(base["redshift"]["A_IR"]))
     print("Baseline redshift:", float(base["redshift"]["redshift"]))
@@ -631,6 +662,8 @@ def run_engine():
         & base["audits"]["volume_ratio_pointwise"]["pass"]
         & base["audits"]["sign_Aprime"]["Aprime_consistent_sign"]
         & base["audits"]["phi_monotone"]["phi_nonincreasing"]
+        & base["audits"]["overflow"]["A_abs_ok"]
+        & base["audits"]["overflow"]["Aprime_abs_ok"]
     )
     print("Baseline audits pass:", base_pass)
 
@@ -683,10 +716,10 @@ def run_engine():
     print("Audits at end:", end["audits_ok"])
 
     return {
-        "baseline":   base,
-        "floors":     floors_info,
-        "sweep":      sweep,
-        "traj":       traj,
+        "baseline":    base,
+        "floors":      floors_info,
+        "sweep":       sweep,
+        "traj":        traj,
         "cartography": carto,
     }
 
